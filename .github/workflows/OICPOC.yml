@@ -1,0 +1,193 @@
+name: OIC Project Migration (OAuth)
+on:
+  workflow_dispatch:
+    inputs:
+      integration_id:
+        description: 'Integration ID to export/import'
+        required: true
+      action:
+        description: 'Action: export or import'
+        required: true
+        default: 'export'
+        type: choice
+        options:
+        - export
+        - import
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+    - name: Set up environment
+      run: |
+        mkdir -p oic_sources
+        sudo apt-get update && sudo apt-get install -y jq unzip curl
+    - name: Get OAuth Token
+      id: get_token
+      run: |
+        if [ "${{ github.event.inputs.action }}" == "export" ]; then
+          TOKEN_URL="${{ secrets.OIC_SOURCE_TOKEN_URL }}"
+          CLIENT_ID="${{ secrets.OIC_SOURCE_CLIENT_ID }}"
+          CLIENT_SECRET="${{ secrets.OIC_SOURCE_CLIENT_SECRET }}"
+          OIC_URL="${{ secrets.OIC_SOURCE_URL }}"
+        else
+          TOKEN_URL="${{ secrets.OIC_TARGET_TOKEN_URL }}"
+          CLIENT_ID="${{ secrets.OIC_TARGET_CLIENT_ID }}"
+          CLIENT_SECRET="${{ secrets.OIC_TARGET_CLIENT_SECRET }}"
+          OIC_URL="${{ secrets.OIC_TARGET_URL }}"
+        fi
+        
+        echo "Fetching OAuth token from ${TOKEN_URL}..."
+        
+        TOKEN_RESPONSE=$(curl -s -X POST \
+          -H "Content-Type: application/x-www-form-urlencoded" \
+          -d "grant_type=client_credentials" \
+          -u "${CLIENT_ID}:${CLIENT_SECRET}" \
+          "${TOKEN_URL}")
+        
+        ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token // empty')
+        if [ -z "$ACCESS_TOKEN" ]; then
+          echo "Error: Failed to get access token"
+          echo "$TOKEN_RESPONSE"
+          exit 1
+        fi
+        
+        echo "token=${ACCESS_TOKEN}" >> $GITHUB_OUTPUT
+        echo "oic_url=${OIC_URL}" >> $GITHUB_OUTPUT
+        echo "OIC_URL=${OIC_URL}" >> $GITHUB_ENV
+    - name: Export from Source OIC
+      if: github.event.inputs.action == 'export'
+      env:
+        ACCESS_TOKEN: ${{ steps.get_token.outputs.token }}
+      run: |
+        INTEGRATION_ID="${{ github.event.inputs.integration_id }}"
+        AUTH_HEADER="Authorization: Bearer $ACCESS_TOKEN"
+        EXPORT_DIR="oic_sources/${INTEGRATION_ID}"
+        TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+        
+        echo "Starting export of ${INTEGRATION_ID} from ${OIC_URL}..."
+        
+        # Request export job
+        JOB_RESPONSE=$(curl -s -X POST \
+          -H "$AUTH_HEADER" \
+          -H "Content-Type: application/json" \
+          -d '{"exportType": "SOURCE"}' \
+          "${OIC_URL}/ic/api/integration/v1/integrations/${INTEGRATION_ID}/export")
+        
+        JOB_ID=$(echo "$JOB_RESPONSE" | jq -r '.id // empty')
+        if [ -z "$JOB_ID" ]; then
+          echo "Error: Failed to get export job ID"
+          echo "$JOB_RESPONSE"
+          exit 1
+        fi
+        
+        echo "Export job ${JOB_ID} started. Polling status..."
+        
+        # Poll status
+        STATUS_URL="${OIC_URL}/ic/api/integration/v1/exports/${JOB_ID}"
+        while true; do
+          STATUS_RESPONSE=$(curl -s -X GET -H "$AUTH_HEADER" "$STATUS_URL")
+          STATUS=$(echo "$STATUS_RESPONSE" | jq -r '.status // empty')
+          
+          if [ "$STATUS" = "SUCCEEDED" ]; then
+            DOWNLOAD_URL=$(echo "$STATUS_RESPONSE" | jq -r '.downloadUrl // empty')
+            if [ -n "$DOWNLOAD_URL" ]; then
+              echo "Export succeeded. Downloading source..."
+              ZIP_FILE="${EXPORT_DIR}_${TIMESTAMP}.zip"
+              curl -s -X GET -H "$AUTH_HEADER" "$DOWNLOAD_URL" -o "$ZIP_FILE"
+              
+              # Extract
+              mkdir -p "$EXPORT_DIR"
+              unzip -o "$ZIP_FILE" -d "$EXPORT_DIR"
+              rm "$ZIP_FILE"
+              
+              echo "Source extracted to $EXPORT_DIR"
+              break
+            else
+              echo "Error: No download URL"
+              exit 1
+            fi
+          elif [ "$STATUS" = "FAILED" ]; then
+            echo "Export failed"
+            echo "$STATUS_RESPONSE"
+            exit 1
+          else
+            echo "Status: $STATUS. Waiting 30s..."
+            sleep 30
+          fi
+        done
+        
+        # Commit to repo
+        git config --global user.name "github-actions"
+        git config --global user.email "actions@github.com"
+        git add "$EXPORT_DIR"
+        git commit -m "Export OIC integration ${INTEGRATION_ID} source - ${TIMESTAMP}" || echo "No changes to commit"
+        git push
+    - name: Import to Target OIC
+      if: github.event.inputs.action == 'import'
+      env:
+        ACCESS_TOKEN: ${{ steps.get_token.outputs.token }}
+      run: |
+        INTEGRATION_ID="${{ github.event.inputs.integration_id }}"
+        AUTH_HEADER="Authorization: Bearer $ACCESS_TOKEN"
+        SOURCE_DIR="oic_sources/${INTEGRATION_ID}"
+        TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+        
+        if [ ! -d "$SOURCE_DIR" ]; then
+          echo "Error: Source directory $SOURCE_DIR not found. Ensure exported sources are in repo."
+          exit 1
+        fi
+        
+        echo "Zipping source from $SOURCE_DIR..."
+        ZIP_FILE="import_${INTEGRATION_ID}_${TIMESTAMP}.zip"
+        cd oic_sources
+        zip -r "../$ZIP_FILE" "${INTEGRATION_ID}"
+        cd ..
+        
+        echo "Starting import of ${INTEGRATION_ID} to ${OIC_URL}..."
+        
+        # Request import job
+        JOB_RESPONSE=$(curl -s -X POST \
+          -H "$AUTH_HEADER" \
+          -F "file=@$ZIP_FILE" \
+          -F 'importType=SOURCE' \
+          "${OIC_URL}/ic/api/integration/v1/integrations/import")
+        
+        JOB_ID=$(echo "$JOB_RESPONSE" | jq -r '.id // empty')
+        if [ -z "$JOB_ID" ]; then
+          echo "Error: Failed to get import job ID"
+          echo "$JOB_RESPONSE"
+          exit 1
+        fi
+        
+        echo "Import job ${JOB_ID} started. Polling status..."
+        
+        # Poll status
+        STATUS_URL="${OIC_URL}/ic/api/integration/v1/imports/${JOB_ID}"
+        while true; do
+          STATUS_RESPONSE=$(curl -s -X GET -H "$AUTH_HEADER" "$STATUS_URL")
+          STATUS=$(echo "$STATUS_RESPONSE" | jq -r '.status // empty')
+          
+          if [ "$STATUS" = "SUCCEEDED" ]; then
+            echo "Import succeeded for ${INTEGRATION_ID}"
+            NEW_ID=$(echo "$STATUS_RESPONSE" | jq -r '.integrationId // empty')
+            echo "New Integration ID: $NEW_ID"
+            break
+          elif [ "$STATUS" = "FAILED" ]; then
+            echo "Import failed"
+            echo "$STATUS_RESPONSE"
+            exit 1
+          else
+            echo "Status: $STATUS. Waiting 30s..."
+            sleep 30
+          fi
+        done
+        
+        rm "$ZIP_FILE"
+    - name: Cleanup
+      if: always()
+      run: |
+        echo "Migration completed with OAuth."
