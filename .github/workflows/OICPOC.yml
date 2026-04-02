@@ -1,193 +1,287 @@
-name: OIC Project Migration (OAuth)
+name: OIC Project Migration
+
 on:
   workflow_dispatch:
     inputs:
-      integration_id:
-        description: 'Integration ID to export/import'
+      project_id:
+        description: "Source OIC project ID"
         required: true
-      action:
-        description: 'Action: export or import'
+      project_name:
+        description: "Project name used for naming the CAR file"
         required: true
-        default: 'export'
+      deployment_label:
+        description: "Optional deployment label, for example 01.00.0000"
+        required: false
+        default: ""
+      activate_after_import:
+        description: "Activate integrations after import"
+        required: true
+        default: "false"
         type: choice
         options:
-        - export
-        - import
+          - "true"
+          - "false"
+      integration_ids_to_activate:
+        description: "Comma-separated integration IDs, for example HELLO_WORLD|01.00.0000,ERP_SYNC|01.00.0001"
+        required: false
+        default: ""
+
+concurrency:
+  group: oic-project-migration-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  migrate:
+  export-import:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      SOURCE_OIC_BASE_URL: ${{ secrets.SOURCE_OIC_BASE_URL }}
+      SOURCE_OIC_TOKEN_URL: ${{ secrets.SOURCE_OIC_TOKEN_URL }}
+      SOURCE_OIC_CLIENT_ID: ${{ secrets.SOURCE_OIC_CLIENT_ID }}
+      SOURCE_OIC_CLIENT_SECRET: ${{ secrets.SOURCE_OIC_CLIENT_SECRET }}
+
+      TARGET_OIC_BASE_URL: ${{ secrets.TARGET_OIC_BASE_URL }}
+      TARGET_OIC_TOKEN_URL: ${{ secrets.TARGET_OIC_TOKEN_URL }}
+      TARGET_OIC_CLIENT_ID: ${{ secrets.TARGET_OIC_CLIENT_ID }}
+      TARGET_OIC_CLIENT_SECRET: ${{ secrets.TARGET_OIC_CLIENT_SECRET }}
+      TARGET_OIC_INSTANCE: ${{ secrets.TARGET_OIC_INSTANCE }}
+
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-      with:
-        token: ${{ secrets.GITHUB_TOKEN }}
-    - name: Set up environment
-      run: |
-        mkdir -p oic_sources
-        sudo apt-get update && sudo apt-get install -y jq unzip curl
-    - name: Get OAuth Token
-      id: get_token
-      run: |
-        if [ "${{ github.event.inputs.action }}" == "export" ]; then
-          TOKEN_URL="${{ secrets.OIC_SOURCE_TOKEN_URL }}"
-          CLIENT_ID="${{ secrets.OIC_SOURCE_CLIENT_ID }}"
-          CLIENT_SECRET="${{ secrets.OIC_SOURCE_CLIENT_SECRET }}"
-          OIC_URL="${{ secrets.OIC_SOURCE_URL }}"
-        else
-          TOKEN_URL="${{ secrets.OIC_TARGET_TOKEN_URL }}"
-          CLIENT_ID="${{ secrets.OIC_TARGET_CLIENT_ID }}"
-          CLIENT_SECRET="${{ secrets.OIC_TARGET_CLIENT_SECRET }}"
-          OIC_URL="${{ secrets.OIC_TARGET_URL }}"
-        fi
-        
-        echo "Fetching OAuth token from ${TOKEN_URL}..."
-        
-        TOKEN_RESPONSE=$(curl -s -X POST \
-          -H "Content-Type: application/x-www-form-urlencoded" \
-          -d "grant_type=client_credentials" \
-          -u "${CLIENT_ID}:${CLIENT_SECRET}" \
-          "${TOKEN_URL}")
-        
-        ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.access_token // empty')
-        if [ -z "$ACCESS_TOKEN" ]; then
-          echo "Error: Failed to get access token"
-          echo "$TOKEN_RESPONSE"
-          exit 1
-        fi
-        
-        echo "token=${ACCESS_TOKEN}" >> $GITHUB_OUTPUT
-        echo "oic_url=${OIC_URL}" >> $GITHUB_OUTPUT
-        echo "OIC_URL=${OIC_URL}" >> $GITHUB_ENV
-    - name: Export from Source OIC
-      if: github.event.inputs.action == 'export'
-      env:
-        ACCESS_TOKEN: ${{ steps.get_token.outputs.token }}
-      run: |
-        INTEGRATION_ID="${{ github.event.inputs.integration_id }}"
-        AUTH_HEADER="Authorization: Bearer $ACCESS_TOKEN"
-        EXPORT_DIR="oic_sources/${INTEGRATION_ID}"
-        TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-        
-        echo "Starting export of ${INTEGRATION_ID} from ${OIC_URL}..."
-        
-        # Request export job
-        JOB_RESPONSE=$(curl -s -X POST \
-          -H "$AUTH_HEADER" \
-          -H "Content-Type: application/json" \
-          -d '{"exportType": "SOURCE"}' \
-          "${OIC_URL}/ic/api/integration/v1/integrations/${INTEGRATION_ID}/export")
-        
-        JOB_ID=$(echo "$JOB_RESPONSE" | jq -r '.id // empty')
-        if [ -z "$JOB_ID" ]; then
-          echo "Error: Failed to get export job ID"
-          echo "$JOB_RESPONSE"
-          exit 1
-        fi
-        
-        echo "Export job ${JOB_ID} started. Polling status..."
-        
-        # Poll status
-        STATUS_URL="${OIC_URL}/ic/api/integration/v1/exports/${JOB_ID}"
-        while true; do
-          STATUS_RESPONSE=$(curl -s -X GET -H "$AUTH_HEADER" "$STATUS_URL")
-          STATUS=$(echo "$STATUS_RESPONSE" | jq -r '.status // empty')
-          
-          if [ "$STATUS" = "SUCCEEDED" ]; then
-            DOWNLOAD_URL=$(echo "$STATUS_RESPONSE" | jq -r '.downloadUrl // empty')
-            if [ -n "$DOWNLOAD_URL" ]; then
-              echo "Export succeeded. Downloading source..."
-              ZIP_FILE="${EXPORT_DIR}_${TIMESTAMP}.zip"
-              curl -s -X GET -H "$AUTH_HEADER" "$DOWNLOAD_URL" -o "$ZIP_FILE"
-              
-              # Extract
-              mkdir -p "$EXPORT_DIR"
-              unzip -o "$ZIP_FILE" -d "$EXPORT_DIR"
-              rm "$ZIP_FILE"
-              
-              echo "Source extracted to $EXPORT_DIR"
-              break
-            else
-              echo "Error: No download URL"
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate required secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REQUIRED_VARS=(
+            SOURCE_OIC_BASE_URL
+            SOURCE_OIC_TOKEN_URL
+            SOURCE_OIC_CLIENT_ID
+            SOURCE_OIC_CLIENT_SECRET
+            TARGET_OIC_BASE_URL
+            TARGET_OIC_TOKEN_URL
+            TARGET_OIC_CLIENT_ID
+            TARGET_OIC_CLIENT_SECRET
+            TARGET_OIC_INSTANCE
+          )
+
+          for v in "${REQUIRED_VARS[@]}"; do
+            if [ -z "${!v:-}" ]; then
+              echo "Missing required secret: $v"
               exit 1
             fi
-          elif [ "$STATUS" = "FAILED" ]; then
-            echo "Export failed"
-            echo "$STATUS_RESPONSE"
+          done
+
+      - name: Set archive filename
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          SAFE_NAME="$(echo "${{ github.event.inputs.project_name }}" | tr ' ' '_' | tr -cd '[:alnum:]_.-')"
+          FILE_NAME="${SAFE_NAME}_$(date -u +%Y%m%d%H%M%S).car"
+          echo "file_name=$FILE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Install jq
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Generate source OAuth token
+        id: source_token
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RESPONSE_FILE="$(mktemp)"
+          HTTP_CODE="$(
+            curl --silent --show-error --write-out "%{http_code}" \
+              --output "$RESPONSE_FILE" \
+              -X POST "$SOURCE_OIC_TOKEN_URL" \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              -u "$SOURCE_OIC_CLIENT_ID:$SOURCE_OIC_CLIENT_SECRET" \
+              -d "grant_type=client_credentials"
+          )"
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "Failed to obtain source token. HTTP status: $HTTP_CODE"
+            cat "$RESPONSE_FILE"
             exit 1
-          else
-            echo "Status: $STATUS. Waiting 30s..."
-            sleep 30
           fi
-        done
-        
-        # Commit to repo
-        git config --global user.name "github-actions"
-        git config --global user.email "actions@github.com"
-        git add "$EXPORT_DIR"
-        git commit -m "Export OIC integration ${INTEGRATION_ID} source - ${TIMESTAMP}" || echo "No changes to commit"
-        git push
-    - name: Import to Target OIC
-      if: github.event.inputs.action == 'import'
-      env:
-        ACCESS_TOKEN: ${{ steps.get_token.outputs.token }}
-      run: |
-        INTEGRATION_ID="${{ github.event.inputs.integration_id }}"
-        AUTH_HEADER="Authorization: Bearer $ACCESS_TOKEN"
-        SOURCE_DIR="oic_sources/${INTEGRATION_ID}"
-        TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-        
-        if [ ! -d "$SOURCE_DIR" ]; then
-          echo "Error: Source directory $SOURCE_DIR not found. Ensure exported sources are in repo."
-          exit 1
-        fi
-        
-        echo "Zipping source from $SOURCE_DIR..."
-        ZIP_FILE="import_${INTEGRATION_ID}_${TIMESTAMP}.zip"
-        cd oic_sources
-        zip -r "../$ZIP_FILE" "${INTEGRATION_ID}"
-        cd ..
-        
-        echo "Starting import of ${INTEGRATION_ID} to ${OIC_URL}..."
-        
-        # Request import job
-        JOB_RESPONSE=$(curl -s -X POST \
-          -H "$AUTH_HEADER" \
-          -F "file=@$ZIP_FILE" \
-          -F 'importType=SOURCE' \
-          "${OIC_URL}/ic/api/integration/v1/integrations/import")
-        
-        JOB_ID=$(echo "$JOB_RESPONSE" | jq -r '.id // empty')
-        if [ -z "$JOB_ID" ]; then
-          echo "Error: Failed to get import job ID"
-          echo "$JOB_RESPONSE"
-          exit 1
-        fi
-        
-        echo "Import job ${JOB_ID} started. Polling status..."
-        
-        # Poll status
-        STATUS_URL="${OIC_URL}/ic/api/integration/v1/imports/${JOB_ID}"
-        while true; do
-          STATUS_RESPONSE=$(curl -s -X GET -H "$AUTH_HEADER" "$STATUS_URL")
-          STATUS=$(echo "$STATUS_RESPONSE" | jq -r '.status // empty')
-          
-          if [ "$STATUS" = "SUCCEEDED" ]; then
-            echo "Import succeeded for ${INTEGRATION_ID}"
-            NEW_ID=$(echo "$STATUS_RESPONSE" | jq -r '.integrationId // empty')
-            echo "New Integration ID: $NEW_ID"
-            break
-          elif [ "$STATUS" = "FAILED" ]; then
-            echo "Import failed"
-            echo "$STATUS_RESPONSE"
+
+          ACCESS_TOKEN="$(jq -r '.access_token // empty' "$RESPONSE_FILE")"
+          EXPIRES_IN="$(jq -r '.expires_in // 0' "$RESPONSE_FILE")"
+
+          if [ -z "$ACCESS_TOKEN" ]; then
+            echo "Source token response did not include access_token"
+            cat "$RESPONSE_FILE"
             exit 1
-          else
-            echo "Status: $STATUS. Waiting 30s..."
-            sleep 30
           fi
-        done
-        
-        rm "$ZIP_FILE"
-    - name: Cleanup
-      if: always()
-      run: |
-        echo "Migration completed with OAuth."
+
+          echo "::add-mask::$ACCESS_TOKEN"
+          echo "token=$ACCESS_TOKEN" >> "$GITHUB_OUTPUT"
+          echo "expires_in=$EXPIRES_IN" >> "$GITHUB_OUTPUT"
+
+      - name: Export project from source OIC
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT_ID="${{ github.event.inputs.project_id }}"
+          DEPLOYMENT_LABEL="${{ github.event.inputs.deployment_label }}"
+          OUTPUT_FILE="${{ steps.vars.outputs.file_name }}"
+
+          if [ -n "$DEPLOYMENT_LABEL" ]; then
+            cat > export_payload.json <<EOF
+          {
+            "name": "${{ github.event.inputs.project_name }}",
+            "code": "${{ github.event.inputs.project_name }}",
+            "type": "DEVELOPED",
+            "label": "$DEPLOYMENT_LABEL"
+          }
+          EOF
+          else
+            cat > export_payload.json <<EOF
+          {
+            "name": "${{ github.event.inputs.project_name }}",
+            "code": "${{ github.event.inputs.project_name }}",
+            "type": "DEVELOPED"
+          }
+          EOF
+          fi
+
+          curl --fail --silent --show-error \
+            -X POST \
+            -H "Authorization: Bearer ${{ steps.source_token.outputs.token }}" \
+            -H "Content-Type: application/json" \
+            -o "$OUTPUT_FILE" \
+            "$SOURCE_OIC_BASE_URL/ic/api/integration/v1/projects/$PROJECT_ID/archive" \
+            -d @export_payload.json
+
+          test -s "$OUTPUT_FILE"
+
+      - name: Upload exported CAR as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oic-project-car
+          path: ${{ steps.vars.outputs.file_name }}
+
+      - name: Generate target OAuth token
+        id: target_token
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RESPONSE_FILE="$(mktemp)"
+          HTTP_CODE="$(
+            curl --silent --show-error --write-out "%{http_code}" \
+              --output "$RESPONSE_FILE" \
+              -X POST "$TARGET_OIC_TOKEN_URL" \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              -u "$TARGET_OIC_CLIENT_ID:$TARGET_OIC_CLIENT_SECRET" \
+              -d "grant_type=client_credentials"
+          )"
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "Failed to obtain target token. HTTP status: $HTTP_CODE"
+            cat "$RESPONSE_FILE"
+            exit 1
+          fi
+
+          ACCESS_TOKEN="$(jq -r '.access_token // empty' "$RESPONSE_FILE")"
+          EXPIRES_IN="$(jq -r '.expires_in // 0' "$RESPONSE_FILE")"
+
+          if [ -z "$ACCESS_TOKEN" ]; then
+            echo "Target token response did not include access_token"
+            cat "$RESPONSE_FILE"
+            exit 1
+          fi
+
+          echo "::add-mask::$ACCESS_TOKEN"
+          echo "token=$ACCESS_TOKEN" >> "$GITHUB_OUTPUT"
+          echo "expires_in=$EXPIRES_IN" >> "$GITHUB_OUTPUT"
+
+      - name: Import project into target OIC
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FILE_NAME="${{ steps.vars.outputs.file_name }}"
+
+          curl --fail --silent --show-error \
+            -X POST \
+            -H "Authorization: Bearer ${{ steps.target_token.outputs.token }}" \
+            -H "Accept: application/json" \
+            -F "file=@${FILE_NAME}" \
+            -F "type=application/octet-stream" \
+            "$TARGET_OIC_BASE_URL/ic/api/integration/v1/projects/archive?integrationInstance=$TARGET_OIC_INSTANCE"
+
+      - name: Refresh target OAuth token before activation
+        if: ${{ github.event.inputs.activate_after_import == 'true' && github.event.inputs.integration_ids_to_activate != '' }}
+        id: target_token_refresh
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RESPONSE_FILE="$(mktemp)"
+          HTTP_CODE="$(
+            curl --silent --show-error --write-out "%{http_code}" \
+              --output "$RESPONSE_FILE" \
+              -X POST "$TARGET_OIC_TOKEN_URL" \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              -u "$TARGET_OIC_CLIENT_ID:$TARGET_OIC_CLIENT_SECRET" \
+              -d "grant_type=client_credentials"
+          )"
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "Failed to refresh target token. HTTP status: $HTTP_CODE"
+            cat "$RESPONSE_FILE"
+            exit 1
+          fi
+
+          ACCESS_TOKEN="$(jq -r '.access_token // empty' "$RESPONSE_FILE")"
+
+          if [ -z "$ACCESS_TOKEN" ]; then
+            echo "Refresh token response did not include access_token"
+            cat "$RESPONSE_FILE"
+            exit 1
+          fi
+
+          echo "::add-mask::$ACCESS_TOKEN"
+          echo "token=$ACCESS_TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Activate integrations in target OIC
+        if: ${{ github.event.inputs.activate_after_import == 'true' && github.event.inputs.integration_ids_to_activate != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IFS=',' read -ra IDS <<< "${{ github.event.inputs.integration_ids_to_activate }}"
+
+          for RAW_ID in "${IDS[@]}"; do
+            ID="$(echo "$RAW_ID" | xargs)"
+            ENCODED_ID="${ID//|/%7C}"
+
+            cat > activate_payload.json <<EOF
+          {
+            "status": "CONFIGURED",
+            "code": "${ID%%|*}",
+            "version": "${ID##*|}",
+            "enabled": true
+          }
+          EOF
+
+            curl --fail --silent --show-error \
+              -X POST \
+              -H "Authorization: Bearer ${{ steps.target_token_refresh.outputs.token }}" \
+              -H "Content-Type: application/json" \
+              -H "X-HTTP-Method-Override: PATCH" \
+              "$TARGET_OIC_BASE_URL/ic/api/integration/v1/integrations/$ENCODED_ID?integrationInstance=$TARGET_OIC_INSTANCE" \
+              -d @activate_payload.json
+
+            echo "Activated: $ID"
+          done
