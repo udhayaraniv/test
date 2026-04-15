@@ -1,4 +1,4 @@
-name: Export project from source OIC
+- name: Export project from source OIC
   id: export_project
   shell: bash
   run: |
