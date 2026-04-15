@@ -1,245 +1,51 @@
-name: OIC Project Export Import
+- name: Export project from source OIC
+  id: export_project
+  shell: bash
+  run: |
+    set -euo pipefail
 
-on:
-  workflow_dispatch:
-    inputs:
-      project_id:
-        description: "OIC project code/id, for example ORCL-R-REST_ECHO_REQUEST"
-        required: true
-        type: string
-      project_name:
-        description: "OIC project display name"
-        required: true
-        type: string
-      project_type:
-        description: "Usually DEVELOPED"
-        required: true
-        default: "DEVELOPED"
-        type: string
-      deployment_label:
-        description: "Optional deployment label, for example 01.00.0006"
-        required: false
-        default: ""
-        type: string
-      archive_name:
-        description: "Archive filename"
-        required: true
-        default: "project.car"
-        type: string
+    EXPORT_URL="https://${SRC_OIC_HOST}/ic/api/integration/v1/projects/${PROJECT_ID}/archive?integrationInstance=${SRC_OIC_INSTANCE}"
 
-jobs:
-  migrate-project:
-    runs-on: ubuntu-latest
+    echo "Export URL: $EXPORT_URL"
+    echo "Project: $PROJECT_ID"
 
-    env:
-      SRC_OIC_HOST: ${{ secrets.SRC_OIC_HOST }}
-      SRC_OIC_INSTANCE: ${{ secrets.SRC_OIC_INSTANCE }}
-      SRC_IDENTITY_DOMAIN_HOST: ${{ secrets.SRC_IDENTITY_DOMAIN_HOST }}
-      SRC_CLIENT_ID: ${{ secrets.SRC_CLIENT_ID }}
-      SRC_CLIENT_SECRET: ${{ secrets.SRC_CLIENT_SECRET }}
-      SRC_SCOPE: ${{ secrets.SRC_SCOPE }}
+    if [ -n "$DEPLOYMENT_LABEL" ]; then
+      cat > request_payload.json <<EOF
+    {
+      "name": "${PROJECT_NAME}",
+      "code": "${PROJECT_ID}",
+      "type": "${PROJECT_TYPE}",
+      "builtBy": "",
+      "label": "${DEPLOYMENT_LABEL}"
+    }
+    EOF
 
-      TGT_OIC_HOST: ${{ secrets.TGT_OIC_HOST }}
-      TGT_OIC_INSTANCE: ${{ secrets.TGT_OIC_INSTANCE }}
-      TGT_IDENTITY_DOMAIN_HOST: ${{ secrets.TGT_IDENTITY_DOMAIN_HOST }}
-      TGT_CLIENT_ID: ${{ secrets.TGT_CLIENT_ID }}
-      TGT_CLIENT_SECRET: ${{ secrets.TGT_CLIENT_SECRET }}
-      TGT_SCOPE: ${{ secrets.TGT_SCOPE }}
+      HTTP_CODE=$(curl -sS -w "%{http_code}" \
+        -o "${ARCHIVE_NAME}" \
+        -X POST "$EXPORT_URL" \
+        -H "Authorization: Bearer ${{ steps.src_token.outputs.token }}" \
+        -H "Content-Type: application/json" \
+        --data @request_payload.json)
 
-      PROJECT_ID: ${{ inputs.project_id }}
-      PROJECT_NAME: ${{ inputs.project_name }}
-      PROJECT_TYPE: ${{ inputs.project_type }}
-      DEPLOYMENT_LABEL: ${{ inputs.deployment_label }}
-      ARCHIVE_NAME: ${{ inputs.archive_name }}
+    else
+      HTTP_CODE=$(curl -sS -w "%{http_code}" \
+        -o "${ARCHIVE_NAME}" \
+        -X POST "$EXPORT_URL" \
+        -H "Authorization: Bearer ${{ steps.src_token.outputs.token }}")
+    fi
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    echo "HTTP Status: $HTTP_CODE"
 
-      - name: Install jq
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq
+    if [ "$HTTP_CODE" != "200" ]; then
+      echo "Export failed. Response:"
+      cat "${ARCHIVE_NAME}" || true
+      exit 1
+    fi
 
-      - name: Normalize secret values
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "SRC_OIC_HOST=$(echo "$SRC_OIC_HOST" | xargs)" >> "$GITHUB_ENV"
-          echo "SRC_OIC_INSTANCE=$(echo "$SRC_OIC_INSTANCE" | xargs)" >> "$GITHUB_ENV"
-          echo "SRC_IDENTITY_DOMAIN_HOST=$(echo "$SRC_IDENTITY_DOMAIN_HOST" | xargs)" >> "$GITHUB_ENV"
-          echo "SRC_SCOPE=$(echo "$SRC_SCOPE" | xargs)" >> "$GITHUB_ENV"
+    if [ ! -s "${ARCHIVE_NAME}" ]; then
+      echo "Archive is empty!"
+      exit 1
+    fi
 
-          echo "TGT_OIC_HOST=$(echo "$TGT_OIC_HOST" | xargs)" >> "$GITHUB_ENV"
-          echo "TGT_OIC_INSTANCE=$(echo "$TGT_OIC_INSTANCE" | xargs)" >> "$GITHUB_ENV"
-          echo "TGT_IDENTITY_DOMAIN_HOST=$(echo "$TGT_IDENTITY_DOMAIN_HOST" | xargs)" >> "$GITHUB_ENV"
-          echo "TGT_SCOPE=$(echo "$TGT_SCOPE" | xargs)" >> "$GITHUB_ENV"
-
-      - name: Get source OAuth token
-        id: src_token
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          BASIC_AUTH="$(printf '%s:%s' "$SRC_CLIENT_ID" "$SRC_CLIENT_SECRET" | base64 -w 0)"
-
-          HTTP_RESPONSE="$(curl -sS -w '\n%{http_code}' \
-            -X POST "https://${SRC_IDENTITY_DOMAIN_HOST}/oauth2/v1/token" \
-            -H "Authorization: Basic ${BASIC_AUTH}" \
-            -H "Content-Type: application/x-www-form-urlencoded;charset=UTF-8" \
-            --data-urlencode "grant_type=client_credentials" \
-            --data-urlencode "scope=${SRC_SCOPE}")"
-
-          RESPONSE_BODY="$(echo "$HTTP_RESPONSE" | sed '$d')"
-          STATUS_CODE="$(echo "$HTTP_RESPONSE" | tail -n1)"
-
-          echo "Token HTTP status: $STATUS_CODE"
-
-          if [ "$STATUS_CODE" != "200" ]; then
-            echo "Token request failed"
-            echo "$RESPONSE_BODY"
-            exit 1
-          fi
-
-          ACCESS_TOKEN="$(echo "$RESPONSE_BODY" | jq -r '.access_token')"
-
-          if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
-            echo "Failed to parse source access token"
-            echo "$RESPONSE_BODY"
-            exit 1
-          fi
-
-          echo "::add-mask::$ACCESS_TOKEN"
-          echo "token=$ACCESS_TOKEN" >> "$GITHUB_OUTPUT"
-
-      - name: Export project archive from source OIC
-        id: export_project
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          EXPORT_URL="https://${SRC_OIC_HOST}/ic/api/integration/v1/projects/${PROJECT_ID}/archive?integrationInstance=${SRC_OIC_INSTANCE}"
-
-          echo "Exporting project ${PROJECT_ID} from ${SRC_OIC_INSTANCE}"
-
-          if [ -n "$DEPLOYMENT_LABEL" ]; then
-            cat > request_payload.json <<EOF
-          {
-            "name": "${PROJECT_NAME}",
-            "code": "${PROJECT_ID}",
-            "type": "${PROJECT_TYPE}",
-            "builtBy": "",
-            "label": "${DEPLOYMENT_LABEL}"
-          }
-          EOF
-
-            HTTP_CODE="$(curl -sS \
-              -o "${ARCHIVE_NAME}" \
-              -w "%{http_code}" \
-              -X POST "$EXPORT_URL" \
-              -H "Authorization: Bearer ${{ steps.src_token.outputs.token }}" \
-              -H "Content-Type: application/json" \
-              --data @request_payload.json)"
-          else
-            HTTP_CODE="$(curl -sS \
-              -o "${ARCHIVE_NAME}" \
-              -w "%{http_code}" \
-              -X POST "$EXPORT_URL" \
-              -H "Authorization: Bearer ${{ steps.src_token.outputs.token }}")"
-          fi
-
-          echo "Export HTTP status: $HTTP_CODE"
-
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "Export failed"
-            test -f "${ARCHIVE_NAME}" && cat "${ARCHIVE_NAME}" || true
-            exit 1
-          fi
-
-          test -s "${ARCHIVE_NAME}" || { echo "Exported archive is empty"; exit 1; }
-
-          echo "archive=${ARCHIVE_NAME}" >> "$GITHUB_OUTPUT"
-
-      - name: Upload exported archive
-        uses: actions/upload-artifact@v4
-        with:
-          name: exported-oic-project
-          path: ${{ steps.export_project.outputs.archive }}
-
-      - name: Get target OAuth token
-        id: tgt_token
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          BASIC_AUTH="$(printf '%s:%s' "$TGT_CLIENT_ID" "$TGT_CLIENT_SECRET" | base64 -w 0)"
-
-          HTTP_RESPONSE="$(curl -sS -w '\n%{http_code}' \
-            -X POST "https://${TGT_IDENTITY_DOMAIN_HOST}/oauth2/v1/token" \
-            -H "Authorization: Basic ${BASIC_AUTH}" \
-            -H "Content-Type: application/x-www-form-urlencoded;charset=UTF-8" \
-            --data-urlencode "grant_type=client_credentials" \
-            --data-urlencode "scope=${TGT_SCOPE}")"
-
-          RESPONSE_BODY="$(echo "$HTTP_RESPONSE" | sed '$d')"
-          STATUS_CODE="$(echo "$HTTP_RESPONSE" | tail -n1)"
-
-          echo "Token HTTP status: $STATUS_CODE"
-
-          if [ "$STATUS_CODE" != "200" ]; then
-            echo "Target token request failed"
-            echo "$RESPONSE_BODY"
-            exit 1
-          fi
-
-          ACCESS_TOKEN="$(echo "$RESPONSE_BODY" | jq -r '.access_token')"
-
-          if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
-            echo "Failed to parse target access token"
-            echo "$RESPONSE_BODY"
-            exit 1
-          fi
-
-          echo "::add-mask::$ACCESS_TOKEN"
-          echo "token=$ACCESS_TOKEN" >> "$GITHUB_OUTPUT"
-
-      - name: Import project archive into target OIC
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          IMPORT_URL="https://${TGT_OIC_HOST}/ic/api/integration/v1/projects/archive?integrationInstance=${TGT_OIC_INSTANCE}"
-
-          HTTP_CODE="$(curl -sS \
-            -o import_response.txt \
-            -w "%{http_code}" \
-            -X POST "$IMPORT_URL" \
-            -H "Authorization: Bearer ${{ steps.tgt_token.outputs.token }}" \
-            -F "file=@${ARCHIVE_NAME}")"
-
-          echo "Import HTTP status: $HTTP_CODE"
-          cat import_response.txt || true
-
-          if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ] && [ "$HTTP_CODE" != "204" ]; then
-            echo "Project import failed"
-            exit 1
-          fi
-
-      - name: Workflow summary
-        shell: bash
-        run: |
-          {
-            echo "## OIC project migration summary"
-            echo ""
-            echo "- Project ID: ${PROJECT_ID}"
-            echo "- Project Name: ${PROJECT_NAME}"
-            echo "- Project Type: ${PROJECT_TYPE}"
-            echo "- Source instance: ${SRC_OIC_INSTANCE}"
-            echo "- Target instance: ${TGT_OIC_INSTANCE}"
-            echo "- Archive: ${ARCHIVE_NAME}"
-            if [ -n "${DEPLOYMENT_LABEL}" ]; then
-              echo "- Deployment label: ${DEPLOYMENT_LABEL}"
-            else
-              echo "- Deployment label: not specified"
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
+    echo "Export successful"
+    echo "archive=${ARCHIVE_NAME}" >> "$GITHUB_OUTPUT"
